@@ -1,0 +1,35 @@
+# ขยะจากระบบปฏิบัติการ
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# ไฟล์ชั่วคราวและ Cache ของ Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.env
+.venv/
+env/
+venv/
+
+# ไฟล์ขยะจาก XAMPP / PHP
+*.log
+.htaccess.backup
+php_errors.log
+
+# ไฟล์สคริปต์ที่มีรหัสลับ (ห้ามเอาขึ้น GitHub)
+git_push.py
+
+# โฟลเดอร์ที่ความสำคัญน้อย หรือไฟล์ชั่วคราวของโปรเจกต์
+scratch/
+_backup/
+temp/
+tmp/
+node_modules/
+
+# ไฟล์ข้อมูลขนาดใหญ่ (ถ้ามี)
+*.zip
+*.rar
+*.7z
+*.sql.gz
