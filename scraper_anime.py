@@ -1,10 +1,8 @@
 """
-scraper_anime.py — ULTRA Edition v13 (Visual Multi-Tab Bypass)
+scraper_anime.py — ULTRA Edition v15 (GitHub Actions / CI Ready)
 แก้ไข:
-  1. ยกเลิกระบบแอบโหลดเบื้องหลัง (Background API) ที่โดน CF ดักได้
-  2. เปลี่ยนมาใช้ระบบ "เปิดแท็บใหม่ (New Page)" สำหรับทุกๆ URL ที่จะดึงข้อมูล
-  3. ปรับลดการดึงพร้อมกันเหลือ 8 แท็บ เพื่อป้องกันเบราว์เซอร์แครช/กินแรมเกิน
-  4. มองเห็นทุกขั้นตอนการทำงานผ่านแท็บที่เด้งเปิด/ปิดเองอัตโนมัติ
+  1. เพิ่ม Arguments '--no-sandbox' และ '--disable-dev-shm-usage' เพื่อให้รันบน Linux/GitHub Actions ได้
+  2. เปิดใช้งาน Headless เต็มรูปแบบ
 """
 import json, os, argparse, asyncio, time, base64, re, urllib.parse
 from bs4 import BeautifulSoup
@@ -12,7 +10,7 @@ from urllib.parse import urlparse, parse_qs
 import aiohttp
 from playwright.async_api import async_playwright
 
-CONCURRENT_REQUESTS = 8  # เปิดพร้อมกันสูงสุด 8 แท็บ (ปรับเพิ่มได้ถ้าคอมแรง)
+CONCURRENT_REQUESTS = 8  # ลดเพื่อไม่ให้กิน RAM ของ GitHub Actions มากเกินไป
 TIMEOUT_SECS        = 30
 MAX_RETRIES         = 3
 BASE_URL            = "https://anime-hdzero.com"
@@ -24,32 +22,26 @@ async def fetch(context, sem, url):
         for attempt in range(1, MAX_RETRIES + 1):
             page = None
             try:
-                # สร้างแท็บใหม่สำหรับทุกลิงก์
                 page = await context.new_page()
-                
                 if DEBUG_MODE:
                     print(f"  [DEBUG] เปิดแท็บโหลด: {url[:90]}")
                     
                 await page.goto(url, timeout=TIMEOUT_SECS * 1000, wait_until="domcontentloaded")
 
-                # เช็คว่าแท็บนี้โดน Cloudflare ดักระหว่างทางไหม
                 title = await page.title()
                 if "Just a moment" in title or "Cloudflare" in title or "Attention Required" in title:
                     if DEBUG_MODE:
                         print(f"  [!] รอแก้ Cloudflare แท็บย่อย: {url[:50]}")
                     try:
-                        # รอให้มันแก้ Captcha ตัวเองเสร็จ (รอสูงสุด 15 วินาที)
                         await page.wait_for_function("document.title.indexOf('Just a moment') === -1", timeout=15000)
                     except:
                         pass
 
-                # ดึง HTML ที่เรนเดอร์สมบูรณ์แล้ว
                 html = await page.content()
                 await page.close()
                 return html
 
             except Exception as e:
-                # ถ้าโหลดพลาด หรือค้าง ให้ปิดแท็บแล้วเริ่มใหม่
                 if page:
                     try: await page.close()
                     except: pass
@@ -77,11 +69,8 @@ def make_abs(href):
 # ── Parsers ───────────────────────────────────────────
 def parse_anime_list(html, label=""):
     soup = BeautifulSoup(html, "html.parser")
-    
-    # พยายามหาจากการ์ดเรื่อง
     cards = soup.select("a.group.block")
     
-    # Aggressive Fallback: กวาดทุกลิงก์ที่มี /anime/ ทั่วทั้งหน้า
     if not cards:
         cards = soup.find_all("a", href=re.compile(r"/anime/\d+"))
         
@@ -91,9 +80,6 @@ def parse_anime_list(html, label=""):
             print(f"  [DEBUG] ข้อมูลว่างเปล่า! ชื่อเพจ: '{page_title}'")
         return []
     
-    if DEBUG_MODE:
-        print(f"  [DEBUG][{label}] พบลิงก์อนิเมะ: {len(cards)} ใบ")
-
     out = []
     seen_links = set()
     
@@ -202,12 +188,6 @@ async def crawl_page(context, sem, source_id, page):
     url = build_list_url(source_id, page)
     html = await fetch(context, sem, url)
     if not html: return []
-    
-    if DEBUG_MODE and page == 1:
-        fname = f"debug_{source_id}_p1.html"
-        try:
-            with open(fname, "w", encoding="utf-8") as f: f.write(html)
-        except: pass
             
     animes = parse_anime_list(html, label=f"{source_id}/p{page}")
     for a in animes:
@@ -248,11 +228,18 @@ async def run_all(categories, is_test, use_cache):
     cache = load_cache() if use_cache else {}
     sem = asyncio.Semaphore(CONCURRENT_REQUESTS)
 
-    print("\n🌐 [ระบบทะลวง CF] กำลังเปิดหน้าต่าง Chrome ขึ้นมาให้ดู (อย่าเพิ่งรีบปิดนะครับ)...")
+    print("\n🌐 [ระบบทะลวง CF] กำลังเปิด Chrome (โหมดเบื้องหลัง)...")
     async with async_playwright() as p:
+        # สิ่งสำคัญสำหรับรันบน GitHub Actions: ต้องใช้ args เหล่านี้เพื่อป้องกันแครช
         browser = await p.chromium.launch(
-            headless=False,
-            args=['--disable-blink-features=AutomationControlled']
+            headless=True,
+            args=[
+                '--disable-blink-features=AutomationControlled',
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-gpu'
+            ]
         )
         browser_context = await browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -266,7 +253,7 @@ async def run_all(categories, is_test, use_cache):
         except Exception:
             pass
 
-        print("🛡️ หากติดหน้าตรวจสอบบอท (Cloudflare) รอให้มันโหลด... หรือคลิกติ๊กถูกด้วยมือได้เลย!")
+        print("🛡️ กำลังตรวจสอบการเชื่อมต่อเบื้องหลัง...")
         passed = False
         for i in range(15):
             await asyncio.sleep(4)
@@ -277,26 +264,21 @@ async def run_all(categories, is_test, use_cache):
                     if "/anime/" in content or "หน้าหลัก" in content:
                         print("✅ ทะลุเข้าหน้าเว็บหลักสำเร็จแล้ว!")
                         
-                        # ----- กดยืนยันสลับธีมมืด ตามที่คุณขอ -----
                         try:
-                            print("🌙 กำลังตั้งค่าเว็บเป็นธีมมืด (Dark Mode)...")
-                            # ค้นหาปุ่มที่มี title="สลับธีม"
                             theme_btn = page.locator('button[title="สลับธีม"]')
                             if await theme_btn.count() > 0:
                                 await theme_btn.first.click()
-                                await asyncio.sleep(2) # รอให้ระบบเซฟ Cookie ธีม
-                                print("✅ สลับธีมมืดเรียบร้อย!")
+                                await asyncio.sleep(2)
                             else:
-                                print("⚠️ ไม่พบปุ่มสลับธีมข้ามไป...")
-                        except Exception as e:
-                            print(f"⚠️ มีปัญหาตอนกดปุ่มสลับธีม: {e}")
-                        # ------------------------------------------
+                                pass
+                        except Exception:
+                            pass
 
                         passed = True
                         break
             except:
                 pass
-            print(f"⏳ ({i+1}/15) รอให้ผ่านหน้า Cloudflare... (เอาเมาส์กดแก้ Captcha บนโครมได้เลยครับ)")
+            print(f"⏳ ({i+1}/15) รอให้ผ่านหน้าโหลดเบื้องหลัง...")
 
         if not passed:
             print("⚠️ หมดเวลา 60 วินาที อาจจะยังไม่ผ่านนะ แต่จะลองดึงข้อมูลดู")
@@ -449,7 +431,7 @@ def main():
     DEBUG_MODE = args.debug
     if DEBUG_MODE: print("🔍 โหมด DEBUG: เปิดใช้งาน\n")
     
-    print("🚀 Anime Scraper — ⚡ ULTRA v13 (Visual Multi-Tab Bypass)\n")
+    print("🚀 Anime Scraper — ⚡ ULTRA v15 (GitHub Actions / CI Ready)\n")
     
     if args.auto:   
         is_test, use_cache, do_upload = False, True, not args.no_upload
@@ -482,7 +464,6 @@ def main():
         input("\nกด Enter เพื่อปิดโปรแกรม...")
 
 if __name__ == "__main__":
-    # ใช้ ProactorEventLoopPolicy เพื่อให้รองรับ subprocess_exec บน Windows (แก้ไข NotImplementedError)
     if os.name == 'nt':
         asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
     
