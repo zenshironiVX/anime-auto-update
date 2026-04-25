@@ -1,9 +1,10 @@
 """
-scraper_anime.py — ULTRA Edition v17 (Turbo CI/CD Mode)
+scraper_anime.py — ULTRA Edition v18 (Stable CI/CD Mode)
 แก้ไข:
-  1. แก้ไขปัญหาค้าง/รอนานบน GitHub Actions ด้วยการบล็อกรูปภาพ, CSS, Fonts (โหลดไวขึ้น 10 เท่า)
-  2. บังคับ Flush ให้ Console ของ GitHub อัปเดตข้อความทันที ไม่ค้างหน้าจอ
-  3. ปรับ Timeout และเพิ่มจำนวนแท็บที่รันพร้อมกันให้ทำงานได้เร็วที่สุด
+  1. ลบระบบบล็อกทรัพยากร (Turbo Mode) ทิ้ง เพราะทำให้ Cloudflare และ JS ของเว็บทำงานผิดพลาด
+  2. เพิ่ม Smart Wait (รอให้การ์ดอนิเมะเรนเดอร์เสร็จก่อนค่อยดึงข้อมูล)
+  3. ปรับ Concurrent เป็น 4 แท็บ เพื่อไม่ให้ GitHub Actions ค้าง (CPU มีจำกัด)
+  4. จำกัดโหมด --auto ไว้ที่หมวดละ 3 หน้าเหมือนเดิม
 """
 import builtins
 import json, os, argparse, asyncio, time, base64, re, urllib.parse
@@ -18,8 +19,8 @@ def _print(*args, **kwargs):
     builtins.print(*args, **kwargs)
 print = _print
 
-CONCURRENT_REQUESTS = 12 # เพิ่มเป็น 12 เพราะเราบล็อกรูปภาพแล้ว กินแรมน้อยลงมาก
-TIMEOUT_SECS        = 20
+CONCURRENT_REQUESTS = 4  # ลดลงเหลือ 4 เพื่อป้องกัน CPU 100% บน GitHub Actions จนค้าง
+TIMEOUT_SECS        = 30
 MAX_RETRIES         = 3
 BASE_URL            = "https://anime-hdzero.com"
 DEBUG_MODE          = False
@@ -34,8 +35,10 @@ async def fetch(context, sem, url):
                 if DEBUG_MODE:
                     print(f"  [DEBUG] เปิดแท็บโหลด: {url[:90]}")
                     
-                await page.goto(url, timeout=TIMEOUT_SECS * 1000, wait_until="domcontentloaded")
+                # โหลดหน้าเว็บ
+                await page.goto(url, timeout=TIMEOUT_SECS * 1000)
 
+                # ตรวจสอบ Cloudflare 
                 title = await page.title()
                 if "Just a moment" in title or "Cloudflare" in title or "Attention Required" in title:
                     if DEBUG_MODE:
@@ -44,6 +47,13 @@ async def fetch(context, sem, url):
                         await page.wait_for_function("document.title.indexOf('Just a moment') === -1", timeout=15000)
                     except:
                         pass
+
+                # Smart Wait: รอให้มี Link อนิเมะ หรือ การ์ดปรากฏขึ้นมาก่อน (สูงสุด 5 วินาที)
+                try:
+                    await page.wait_for_selector("a[href*='/anime/']", timeout=5000)
+                except:
+                    # ถ้าหาไม่เจอ ให้รอเพิ่มอีกนิดเผื่อเน็ตช้า
+                    await asyncio.sleep(2)
 
                 html = await page.content()
                 await page.close()
@@ -253,18 +263,11 @@ async def run_all(categories, is_test, use_cache, is_auto=False):
             viewport={'width': 1280, 'height': 720}
         )
         
-        # ⚡ TURBO MODE: บล็อกการโหลดรูปภาพ วิดีโอ และ CSS เพื่อเร่งความเร็วขั้นสุด
-        async def block_heavy_resources(route):
-            if route.request.resource_type in ["image", "media", "font", "stylesheet"]:
-                await route.abort()
-            else:
-                await route.continue_()
-                
         page = await browser_context.new_page()
 
         print(f"⏳ กำลังวิ่งเข้าเว็บ {BASE_URL} ...")
         try:
-            await page.goto(BASE_URL, timeout=30000, wait_until="domcontentloaded")
+            await page.goto(BASE_URL, timeout=30000)
         except Exception:
             pass
 
@@ -294,10 +297,6 @@ async def run_all(categories, is_test, use_cache, is_auto=False):
 
         if not passed:
             print("⚠️ อาจจะยังไม่ผ่านระบบป้องกัน แต่จะลองดึงข้อมูลดู...")
-
-        # เปิดใช้ Turbo Mode หลังจากผ่าน Cloudflare หน้าแรกแล้ว
-        print("⚡ เปิดใช้งานระบบ Turbo Mode (บล็อกรูปภาพ/CSS) เร่งความเร็วการสแกน...")
-        await browser_context.route("**/*", block_heavy_resources)
 
         print(f"\n🚀 เริ่มกวาดข้อมูลแบบ Multi-Tab (โหลดพร้อมกัน {CONCURRENT_REQUESTS} แท็บ)...")
         
@@ -340,7 +339,7 @@ async def run_all(categories, is_test, use_cache, is_auto=False):
         done = 0
         for coro in asyncio.as_completed(tasks):
             await coro; done += 1
-            if done % 20 == 0 or done == len(tasks): # อัปเดตบ่อยขึ้นทุกๆ 20 เรื่อง
+            if done % 20 == 0 or done == len(tasks): 
                 print(f"  [+] สแกนตอนแล้ว: {done}/{len(tasks)} เรื่อง")
 
         to_crack, cached_n = [], 0
@@ -360,7 +359,7 @@ async def run_all(categories, is_test, use_cache, is_auto=False):
             done = 0
             for coro in asyncio.as_completed(vtasks):
                 await coro; done += 1
-                if done % 50 == 0 or done == len(vtasks): # อัปเดตบ่อยขึ้นทุกๆ 50 ตอน
+                if done % 50 == 0 or done == len(vtasks): 
                     print(f"  [+] เจาะเสร็จแล้ว: {done}/{len(vtasks)} ตอน")
         else:
             print("\n✨ ทุกตอนมีลิ้งก์จริงในแคชแล้ว ข้ามการเจาะลิ้งก์")
@@ -453,7 +452,7 @@ def main():
     DEBUG_MODE = args.debug
     if DEBUG_MODE: print("🔍 โหมด DEBUG: เปิดใช้งาน\n")
     
-    print("🚀 Anime Scraper — ⚡ ULTRA v17 (Turbo CI/CD Mode)\n")
+    print("🚀 Anime Scraper — ⚡ ULTRA v18 (Stable CI/CD Mode)\n")
     
     if args.auto:   
         is_test, use_cache, do_upload, is_auto = False, True, not args.no_upload, True
