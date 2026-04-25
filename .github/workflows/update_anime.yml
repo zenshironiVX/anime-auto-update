@@ -20,7 +20,17 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
+          # ติดตั้งไฟล์ requirements เดิมของคุณ
           pip install -r requirements.txt
+          
+          # ติดตั้งไลบรารีที่บังคับใช้ใน V15 (เผื่อตกหล่นใน requirements.txt)
+          pip install playwright beautifulsoup4 aiohttp curl_cffi
+          
+          # 🚨 ส่วนที่สำคัญที่สุดสำหรับ GitHub Actions 🚨
+          # สั่งให้ Playwright โหลดเบราว์เซอร์ Chromium เข้าเซิร์ฟเวอร์
+          playwright install chromium
+          # ติดตั้ง System Dependencies ของ Ubuntu Linux ที่ Chrome จำเป็นต้องใช้
+          playwright install-deps chromium
 
       - name: Run Scrapper and Push to API
         env:
