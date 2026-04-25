@@ -1,11 +1,10 @@
 """
-scraper_anime.py — ULTRA Edition v4 (Bypass Ads + Tailwind Ready + Robust Fallbacks)
+scraper_anime.py — ULTRA Edition v5 (Ultimate Ad Bypass + Anti-Bot Spoofing)
 แก้ไข:
-  1. ดึง HTML ตรงจาก CSS Class ล่าสุด (Tailwind)
-  2. ทะลวง iframe แก้ Base64 Decode ตัดเว็บโฆษณา/เว็บพนัน
-  3. นำ Fallback แบบ V2 กลับมา (ป้องกันปัญหาหาการ์ดอนิเมะไม่เจอแล้วเหลือ 0 เรื่อง)
-  4. ปรับระบบ Sort ตอนให้มีแผนสำรอง
-  5. ดัมพ์ไฟล์ HTML ตอนเปิด --debug กลับมาเพื่อเช็ค Cloudflare
+  1. ปลอมแปลง Headers เต็มรูปแบบเพื่อหลบหลีก Cloudflare / Bot Protection
+  2. เพิ่มระบบตรวจจับแจ้งเตือนหากโดน Cloudflare บล็อก (ป้องกันปัญหาดึงมาได้ 0 เรื่อง)
+  3. Aggressive Fallback กวาดทุกลิงก์ /anime/ แบบครอบจักรวาล
+  4. ถอดรหัส Base64 ของ iframe ขั้นเทพ (แก้อาการ Padding error)
 """
 import json, os, argparse, asyncio, aiohttp, time, base64, re, ssl, urllib.parse
 from bs4 import BeautifulSoup
@@ -18,17 +17,20 @@ CONNECTOR_LIMIT     = 120
 BASE_URL            = "https://anime-hdzero.com"
 DEBUG_MODE          = False
 
+# ปลอมตัวเป็นเบราว์เซอร์จริง 100% เพื่อลดโอกาสโดนแบน
 HEADERS = {
-    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                   "AppleWebKit/537.36 (KHTML, like Gecko) "
-                   "Chrome/124.0.0.0 Safari/537.36"),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
     "Accept-Language": "th-TH,th;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Accept-Encoding": "gzip, deflate",
+    "Accept-Encoding": "gzip, deflate, br, zstd",
+    "Sec-Ch-Ua": "\"Chromium\";v=\"124\", \"Google Chrome\";v=\"124\", \"Not-A.Brand\";v=\"99\"",
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": "\"Windows\"",
     "Sec-Fetch-Dest": "document",
     "Sec-Fetch-Mode": "navigate",
     "Sec-Fetch-Site": "none",
     "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
     "Cache-Control": "max-age=0",
 }
 
@@ -46,8 +48,8 @@ async def fetch(session, sem, url):
 
                     if resp.status == 200:
                         return await resp.text(errors="replace")
-                    elif resp.status == 403:
-                        print(f"  [!] 403 Forbidden: {url[:70]} (อาจติด Cloudflare)")
+                    elif resp.status in [403, 503]:
+                        print(f"  [!] {resp.status} Forbidden/Service Unavailable: {url[:70]} (อาจติด Cloudflare)")
                         await asyncio.sleep(2**attempt); continue
                     elif resp.status == 429:
                         wait = 5*attempt
@@ -85,26 +87,43 @@ def make_abs(href):
 
 # ── Parsers ───────────────────────────────────────────
 def parse_anime_list(html, label=""):
+    # ตรวจจับ Cloudflare
+    if "Just a moment..." in html or "cf-browser-verification" in html or "ray_id" in html:
+        print(f"  [!] 🚨 ตรวจพบระบบป้องกันบอท (Cloudflare) ในหน้า {label}!")
+        return []
+
     soup = BeautifulSoup(html, "html.parser")
     
-    # 1. พยายามหาจาก CSS Class ปัจจุบัน
+    # 1. พยายามหาจาก CSS Class ปัจจุบัน (a.group.block)
     cards = soup.select("a.group.block")
     
-    # 2. Fallback แบบ V2: ถ้าหาการ์ดไม่เจอ ให้กวาดทุกลิงก์ที่มีคำว่า /anime/ แทน
+    # 2. Aggressive Fallback: กวาดทุกลิงก์ที่มี /anime/ ทั่วทั้งหน้า
     if not cards:
-        cards = [a for a in soup.find_all("a", href=True) if re.search(r"/anime/\d+", a.get("href", ""))]
+        cards = []
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if re.search(r"^/anime/\d+/?$", href) or re.search(r"^https?://[^/]+/anime/\d+/?$", href):
+                cards.append(a)
     
     if DEBUG_MODE:
-        print(f"  [DEBUG][{label}] พบการ์ดอนิเมะทั้งหมด: {len(cards)} ใบ")
+        print(f"  [DEBUG][{label}] พบการ์ดอนิเมะ: {len(cards)} ใบ")
 
     out = []
+    seen_links = set()
+    
     for card in cards:
         href = card.get("href", "")
-        if not re.search(r"/anime/\d+", href): continue
+        if not href or "/anime/" not in href or "/episode/" in href: 
+            continue
+            
+        abs_link = make_abs(href)
+        if abs_link in seen_links: 
+            continue
+        seen_links.add(abs_link)
 
         img = card.find("img")
 
-        # Title (พยายามหาทุกวิถีทาง)
+        # Title Extraction
         title = ""
         title_elem = card.select_one(".font-display")
         if not title_elem:
@@ -115,19 +134,18 @@ def parse_anime_list(html, label=""):
         elif img and img.get("alt"):
             title = img.get("alt", "").strip()
             
-        # ถ้ายังไม่ได้ Title อีก ให้เอาข้อความในการ์ด หรือดึงรหัสจาก URL มาใช้แทนชั่วคราว (กันพลาด)
         if not title:
             title = card.get_text(strip=True)[:80]
         if not title:
             title = f"Anime_{href.split('/')[-1]}"
 
-        # Cover Image
+        # Cover Image Extraction
         cover = img.get("src", "") if img else ""
         if not cover and img:
             ss = img.get("srcset", "")
             if ss: cover = ss.split(",")[0].strip().split()[0]
         
-        # Badge (SUB, DUB, MOVIE, AIRING)
+        # Badge Extraction (SUB, DUB, MOVIE, AIRING)
         badge_elem = card.select_one(".sticker")
         if not badge_elem:
             badge_elem = card.find(class_="sticker")
@@ -135,7 +153,7 @@ def parse_anime_list(html, label=""):
 
         out.append({
             "title": title,
-            "link": make_abs(href),
+            "link": abs_link,
             "cover": cover,
             "badge": badge,
             "episodes": [],
@@ -153,7 +171,7 @@ def parse_episodes(html):
     soup = BeautifulSoup(html, "html.parser")
     eps = []
     
-    # 1. ค้นหาจาก CSS Class ปัจจุบัน
+    # 1. ค้นหาจาก CSS Class
     for a in soup.select("a.ep-row"):
         href = a.get("href", "")
         if "/episode/" not in href: continue
@@ -162,23 +180,19 @@ def parse_episodes(html):
         title = span.get_text(strip=True) if span else href.split("/")[-1]
         eps.append({"title": title, "url": make_abs(href)})
         
-    # 2. Fallback: ถ้าหาตอนไม่เจอ ให้หาทุกลิงก์ที่มี /episode/
+    # 2. Fallback
     if not eps:
         for a in soup.find_all("a", href=re.compile(r"/episode/\d+")):
             title = a.get_text(strip=True) or a.get("href", "").split("/")[-1]
             eps.append({"title": title, "url": make_abs(a["href"])})
     
-    # ฟังก์ชันสกัดตัวเลขตอนสำหรับจัดเรียง (มีแผนสำรอง)
+    # Sort Episodes
     def extract_ep_num(ep):
         title = ep.get("title", "")
         url = ep.get("url", "")
-        
-        # กรองตัวเลขจากคำว่า "ตอนที่ X" หรือ "EP X"
         match = re.search(r'(?:ตอนที่|EP\.?)\s*(\d+)', title, re.IGNORECASE)
         if match:
             return int(match.group(1))
-            
-        # ถ้าไม่มี ให้ดึงจากเลข ID ท้ายลิงก์ URL แทน
         match_url = re.search(r'/episode/(\d+)', url)
         return int(match_url.group(1)) if match_url else 0
 
@@ -186,7 +200,7 @@ def parse_episodes(html):
     return eps
 
 def decode_video(html):
-    """เจาะทะลุ iframe โฆษณา เพื่อดึงลิ้งก์สตรีมจริง (akuma-player ฯลฯ)"""
+    """เจาะ iframe โฆษณา/เว็บพนัน เพื่อดึงลิ้งก์สตรีมจริง (akuma-player ฯลฯ)"""
     soup = BeautifulSoup(html, "html.parser")
     iframes = soup.find_all("iframe")
     
@@ -199,9 +213,9 @@ def decode_video(html):
             qs = parse_qs(urlparse(src).query)
             if "link" in qs:
                 encoded_link = qs["link"][0]
-                # แก้ URL Encoding (เผื่อถูกเข้ารหัสมา %2B, %3D)
+                # แก้ URL Encoding
                 encoded_link = urllib.parse.unquote(encoded_link)
-                # เติม Padding ให้ครบถ้วน ป้องกัน Base64 ถอดรหัสไม่ได้
+                # เติม Padding ให้ครบถ้วน
                 b64 = encoded_link + "=" * ((4 - len(encoded_link) % 4) % 4)
                 try:
                     real_url = base64.b64decode(b64).decode("utf-8")
@@ -211,8 +225,8 @@ def decode_video(html):
                     if DEBUG_MODE: print(f"  [DEBUG] Base64 Decode Error: {e}")
                     pass
         
-        # 2. ถ้าเจอลิ้งก์ตรงโดยไม่ต้อง Decode (Player หลัก)
-        elif any(player in src for player in ["akuma-player", "dood", "ok.ru"]):
+        # 2. ค้นหาเครื่องเล่นวิดีโอทั่วไป
+        elif any(player in src for player in ["akuma-player", "dood", "ok.ru", "stream"]):
             return src if src.startswith("http") else make_abs(src)
 
     return None
@@ -223,7 +237,7 @@ async def crawl_page(session, sem, source_id, page):
     html = await fetch(session, sem, url)
     if not html: return []
     
-    # ดัมพ์ไฟล์ HTML ออกมาเช็คในโหมด Debug ว่าเว็บส่ง Cloudflare Challenge มาหรือไม่
+    # ดัมพ์ไฟล์ HTML ออกมาเช็คในโหมด Debug
     if DEBUG_MODE and page == 1:
         fname = f"debug_{source_id}_p1.html"
         try:
@@ -312,8 +326,10 @@ async def run_all(categories, is_test, use_cache):
 
         print(f"\n📌 ดึงข้อมูลโครงสร้างเสร็จสิ้น: รวม {len(all_animes)} เรื่อง")
         if not all_animes:
-            print("\n❌ ได้ 0 เรื่อง! ลองรัน: python scraper_anime.py --debug --test")
-            print("   (แนะนำให้เข้าไปดูไฟล์ debug_HOME_p1.html เพื่อเช็คหน้าจอติด Cloudflare หรือไม่)")
+            print("\n❌ ได้ 0 เรื่อง!")
+            print("💡 คำแนะนำ: หากคุณเจอ 0 เรื่องตลอด อาจเป็นไปได้สูงมากที่เว็บไซต์บล็อก IP หรือป้องกันบอท (Cloudflare) ลองรัน:")
+            print("   python scraper_anime.py --debug --test")
+            print("   และเข้าไปเปิดดูไฟล์ debug_HOME_p1.html เพื่อตรวจสอบ")
             return []
 
         # 2) episodes
@@ -437,7 +453,7 @@ def main():
     DEBUG_MODE = args.debug
     if DEBUG_MODE: print("🔍 โหมด DEBUG: เปิดใช้งาน\n")
     
-    print("🚀 Anime Scraper — ⚡ ULTRA v4 (Ad Bypass + Robust Fallbacks)\n")
+    print("🚀 Anime Scraper — ⚡ ULTRA v5 (Ultimate Ad Bypass + Anti-Bot Spoofing)\n")
     
     if args.auto:   
         is_test, use_cache, do_upload = False, True, not args.no_upload
