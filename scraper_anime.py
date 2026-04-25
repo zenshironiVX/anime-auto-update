@@ -416,19 +416,54 @@ async def push_to_api(export_data):
             batches.append({cid: {"name": cd["name"], "animes": animes[i:i+BATCH]}})
             
     h = {"Content-Type":"application/json", "X-Admin-Key":key}
-    async with aiohttp.ClientSession() as session:
-        print(f"\n🚀 กำลังส่ง {len(batches)} ชุดข้อมูล → API: {url}")
+    
+    print(f"\n🚀 กำลังส่ง {len(batches)} ชุดข้อมูล → API: {url}")
+    print("🛡️ กำลัง Bypass ระบบป้องกันของเซิร์ฟเวอร์ API (aes.js)...")
+    
+    # ใช้ Playwright ในการยิง API เพื่อให้ผ่านหน้า aes.js ของโฮสติ้งปลายทาง
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=True,
+            args=[
+                '--disable-blink-features=AutomationControlled',
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-gpu'
+            ]
+        )
+        context = await browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        )
+        page = await context.new_page()
+        
+        # วิ่งเข้าโดเมน API ก่อนเพื่อให้ aes.js สร้าง Cookie
+        base_api_url = url.split("?")[0]
+        try:
+            await page.goto(base_api_url, timeout=30000)
+            await asyncio.sleep(5)  # รอให้สคริปต์ aes.js คำนวณและหน้าเว็บรีเฟรช 5 วินาที
+        except:
+            pass
+            
         for i, batch in enumerate(batches, 1):
             try:
-                async with session.post(url, json=batch, headers=h, timeout=aiohttp.ClientTimeout(total=60)) as resp:
-                    text = await resp.text()
-                    try:
-                        r = json.loads(text)
-                        print(f"  {'✅' if r.get('success') else '❌'} ชุดที่ {i}/{len(batches)}: {r.get('message','')}")
-                    except:
-                        print(f"  [!] ชุดที่ {i}/{len(batches)}: HTTP {resp.status} {text[:100]}...")
+                # ยิง POST ภายใต้ context ที่ได้ใบผ่านทางเรียบร้อยแล้ว
+                resp = await context.request.post(
+                    url, 
+                    data=json.dumps(batch).encode('utf-8'), 
+                    headers=h, 
+                    timeout=60000
+                )
+                text = await resp.text()
+                try:
+                    r = json.loads(text)
+                    print(f"  {'✅' if r.get('success') else '❌'} ชุดที่ {i}/{len(batches)}: {r.get('message','')}")
+                except:
+                    print(f"  [!] ชุดที่ {i}/{len(batches)}: HTTP {resp.status} {text[:100]}...")
             except Exception as e:
                 print(f"  [!] ชุดที่ {i}: ส่งผิดพลาด ({e})")
+                
+        await browser.close()
     print("✅ การอัปโหลดเสร็จสิ้น!")
 
 # ── Entry point ───────────────────────────────────────
