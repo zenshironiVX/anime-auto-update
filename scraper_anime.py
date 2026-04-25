@@ -1,8 +1,9 @@
 """
-scraper_anime.py — ULTRA Edition v15 (GitHub Actions / CI Ready)
+scraper_anime.py — ULTRA Edition v16 (GitHub Actions / Auto 3-Pages Limit)
 แก้ไข:
-  1. เพิ่ม Arguments '--no-sandbox' และ '--disable-dev-shm-usage' เพื่อให้รันบน Linux/GitHub Actions ได้
-  2. เปิดใช้งาน Headless เต็มรูปแบบ
+  1. โหมด --auto จะจำกัดการสแกนแค่ 3 หน้าแรกของแต่ละหมวดหมู่ เพื่อความรวดเร็วในการอัปเดตและป้องกันการถูกแบน
+  2. เพิ่ม Arguments '--no-sandbox' และ '--disable-dev-shm-usage' เพื่อให้รันบน Linux/GitHub Actions ได้
+  3. เปิดใช้งาน Headless เต็มรูปแบบ
 """
 import json, os, argparse, asyncio, time, base64, re, urllib.parse
 from bs4 import BeautifulSoup
@@ -224,7 +225,7 @@ def load_cache(path="anime_data.js"):
     return cache
 
 # ── Main pipeline ─────────────────────────────────────
-async def run_all(categories, is_test, use_cache):
+async def run_all(categories, is_test, use_cache, is_auto=False):
     cache = load_cache() if use_cache else {}
     sem = asyncio.Semaphore(CONCURRENT_REQUESTS)
 
@@ -288,7 +289,15 @@ async def run_all(categories, is_test, use_cache):
         all_animes, seen, sort_idx = [], set(), 1_000_000
         for cat in categories:
             print(f"\n[1/3] หมวดหมู่: {cat['name']}")
-            max_pg = 1 if is_test else cat["max_page"]
+            
+            # 🎯 หัวใจสำคัญของการแก้ไข: จำกัดหน้าถ้าเป็นโหมด Auto หรือ Test
+            if is_test:
+                max_pg = 1
+            elif is_auto:
+                max_pg = min(3, cat["max_page"]) # ดึงแค่ 3 หน้าแรกเท่านั้น!
+            else:
+                max_pg = cat["max_page"]
+
             empty_streak = 0
             for page_num in range(1, max_pg+1):
                 batch = await crawl_page(browser_context, sem, cat["source_id"], page_num)
@@ -305,7 +314,6 @@ async def run_all(categories, is_test, use_cache):
                         a["sort_order"] = sort_idx; sort_idx -= 1
                         all_animes.append(a); added += 1
                 print(f"  [+] ดึงหน้า {page_num}: สำเร็จ +{added} เรื่อง (รวม {len(all_animes)})")
-                if is_test: break
 
         print(f"\n📌 ดึงข้อมูลโครงสร้างเสร็จสิ้น: รวม {len(all_animes)} เรื่อง")
         if not all_animes:
@@ -431,29 +439,29 @@ def main():
     DEBUG_MODE = args.debug
     if DEBUG_MODE: print("🔍 โหมด DEBUG: เปิดใช้งาน\n")
     
-    print("🚀 Anime Scraper — ⚡ ULTRA v15 (GitHub Actions / CI Ready)\n")
+    print("🚀 Anime Scraper — ⚡ ULTRA v16 (GitHub Actions / Auto 3-Pages Limit)\n")
     
     if args.auto:   
-        is_test, use_cache, do_upload = False, True, not args.no_upload
-        print("🤖 หมวด: AUTO (อัปเดตเฉพาะตอนใหม่)")
+        is_test, use_cache, do_upload, is_auto = False, True, not args.no_upload, True
+        print("🤖 หมวด: AUTO (อัปเดตเฉพาะ 3 หน้าแรกของแต่ละหมวด)")
     elif args.test: 
-        is_test, use_cache, do_upload = True, False, False
+        is_test, use_cache, do_upload, is_auto = True, False, False, False
         print("🧪 หมวด: TEST (ดึงเฉพาะหน้าแรกเพื่อทดสอบ)")
     elif args.full: 
-        is_test, use_cache, do_upload = False, False, not args.no_upload
+        is_test, use_cache, do_upload, is_auto = False, False, not args.no_upload, False
         print("💥 หมวด: FULL (ดึงใหม่ทั้งหมด ล้างแคช)")
     else:
         print("กรุณาเลือกโหมดการทำงาน:")
         print("  1 = ดึงใหม่ทั้งหมด (Full)")
         print("  2 = ทดสอบระบบ (Test 1 หน้า)")
-        print("  3 = อัปเดตแบบรวดเร็ว (Fast Update / ใช้ Cache)")
+        print("  3 = อัปเดตแบบรวดเร็ว (Fast Update / ใช้ Cache / จำกัด 3 หน้า)")
         c = input("👉 เลือกตัวเลข: ").strip()
-        is_test, use_cache, do_upload = (c=="2"), (c=="3"), False
+        is_test, use_cache, do_upload, is_auto = (c=="2"), (c=="3"), False, (c=="3")
         
     t0 = time.time()
     
     # รัน Event loop ของ asyncio
-    animes = asyncio.run(run_all(CATEGORIES, is_test, use_cache))
+    animes = asyncio.run(run_all(CATEGORIES, is_test, use_cache, is_auto))
     export = save_to_file(animes)
     
     if do_upload: 
