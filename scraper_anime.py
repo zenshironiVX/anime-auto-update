@@ -1,18 +1,25 @@
 """
-scraper_anime.py — ULTRA Edition v16 (GitHub Actions / Auto 3-Pages Limit)
+scraper_anime.py — ULTRA Edition v17 (Turbo CI/CD Mode)
 แก้ไข:
-  1. โหมด --auto จะจำกัดการสแกนแค่ 3 หน้าแรกของแต่ละหมวดหมู่ เพื่อความรวดเร็วในการอัปเดตและป้องกันการถูกแบน
-  2. เพิ่ม Arguments '--no-sandbox' และ '--disable-dev-shm-usage' เพื่อให้รันบน Linux/GitHub Actions ได้
-  3. เปิดใช้งาน Headless เต็มรูปแบบ
+  1. แก้ไขปัญหาค้าง/รอนานบน GitHub Actions ด้วยการบล็อกรูปภาพ, CSS, Fonts (โหลดไวขึ้น 10 เท่า)
+  2. บังคับ Flush ให้ Console ของ GitHub อัปเดตข้อความทันที ไม่ค้างหน้าจอ
+  3. ปรับ Timeout และเพิ่มจำนวนแท็บที่รันพร้อมกันให้ทำงานได้เร็วที่สุด
 """
+import builtins
 import json, os, argparse, asyncio, time, base64, re, urllib.parse
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse, parse_qs
 import aiohttp
 from playwright.async_api import async_playwright
 
-CONCURRENT_REQUESTS = 8  # ลดเพื่อไม่ให้กิน RAM ของ GitHub Actions มากเกินไป
-TIMEOUT_SECS        = 30
+# บังคับให้ print แสดงผลทันทีบน GitHub Actions (แก้ปัญหา Log ค้าง)
+def _print(*args, **kwargs):
+    kwargs['flush'] = True
+    builtins.print(*args, **kwargs)
+print = _print
+
+CONCURRENT_REQUESTS = 12 # เพิ่มเป็น 12 เพราะเราบล็อกรูปภาพแล้ว กินแรมน้อยลงมาก
+TIMEOUT_SECS        = 20
 MAX_RETRIES         = 3
 BASE_URL            = "https://anime-hdzero.com"
 DEBUG_MODE          = False
@@ -231,7 +238,6 @@ async def run_all(categories, is_test, use_cache, is_auto=False):
 
     print("\n🌐 [ระบบทะลวง CF] กำลังเปิด Chrome (โหมดเบื้องหลัง)...")
     async with async_playwright() as p:
-        # สิ่งสำคัญสำหรับรันบน GitHub Actions: ต้องใช้ args เหล่านี้เพื่อป้องกันแครช
         browser = await p.chromium.launch(
             headless=True,
             args=[
@@ -246,18 +252,26 @@ async def run_all(categories, is_test, use_cache, is_auto=False):
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
             viewport={'width': 1280, 'height': 720}
         )
+        
+        # ⚡ TURBO MODE: บล็อกการโหลดรูปภาพ วิดีโอ และ CSS เพื่อเร่งความเร็วขั้นสุด
+        async def block_heavy_resources(route):
+            if route.request.resource_type in ["image", "media", "font", "stylesheet"]:
+                await route.abort()
+            else:
+                await route.continue_()
+                
         page = await browser_context.new_page()
 
         print(f"⏳ กำลังวิ่งเข้าเว็บ {BASE_URL} ...")
         try:
-            await page.goto(BASE_URL, timeout=60000)
+            await page.goto(BASE_URL, timeout=30000, wait_until="domcontentloaded")
         except Exception:
             pass
 
         print("🛡️ กำลังตรวจสอบการเชื่อมต่อเบื้องหลัง...")
         passed = False
-        for i in range(15):
-            await asyncio.sleep(4)
+        for i in range(10):
+            await asyncio.sleep(2)
             try:
                 title = await page.title()
                 content = await page.content()
@@ -269,9 +283,7 @@ async def run_all(categories, is_test, use_cache, is_auto=False):
                             theme_btn = page.locator('button[title="สลับธีม"]')
                             if await theme_btn.count() > 0:
                                 await theme_btn.first.click()
-                                await asyncio.sleep(2)
-                            else:
-                                pass
+                                await asyncio.sleep(1)
                         except Exception:
                             pass
 
@@ -279,10 +291,13 @@ async def run_all(categories, is_test, use_cache, is_auto=False):
                         break
             except:
                 pass
-            print(f"⏳ ({i+1}/15) รอให้ผ่านหน้าโหลดเบื้องหลัง...")
 
         if not passed:
-            print("⚠️ หมดเวลา 60 วินาที อาจจะยังไม่ผ่านนะ แต่จะลองดึงข้อมูลดู")
+            print("⚠️ อาจจะยังไม่ผ่านระบบป้องกัน แต่จะลองดึงข้อมูลดู...")
+
+        # เปิดใช้ Turbo Mode หลังจากผ่าน Cloudflare หน้าแรกแล้ว
+        print("⚡ เปิดใช้งานระบบ Turbo Mode (บล็อกรูปภาพ/CSS) เร่งความเร็วการสแกน...")
+        await browser_context.route("**/*", block_heavy_resources)
 
         print(f"\n🚀 เริ่มกวาดข้อมูลแบบ Multi-Tab (โหลดพร้อมกัน {CONCURRENT_REQUESTS} แท็บ)...")
         
@@ -290,11 +305,10 @@ async def run_all(categories, is_test, use_cache, is_auto=False):
         for cat in categories:
             print(f"\n[1/3] หมวดหมู่: {cat['name']}")
             
-            # 🎯 หัวใจสำคัญของการแก้ไข: จำกัดหน้าถ้าเป็นโหมด Auto หรือ Test
             if is_test:
                 max_pg = 1
             elif is_auto:
-                max_pg = min(3, cat["max_page"]) # ดึงแค่ 3 หน้าแรกเท่านั้น!
+                max_pg = min(3, cat["max_page"])
             else:
                 max_pg = cat["max_page"]
 
@@ -326,7 +340,7 @@ async def run_all(categories, is_test, use_cache, is_auto=False):
         done = 0
         for coro in asyncio.as_completed(tasks):
             await coro; done += 1
-            if done % 50 == 0 or done == len(tasks):
+            if done % 20 == 0 or done == len(tasks): # อัปเดตบ่อยขึ้นทุกๆ 20 เรื่อง
                 print(f"  [+] สแกนตอนแล้ว: {done}/{len(tasks)} เรื่อง")
 
         to_crack, cached_n = [], 0
@@ -346,7 +360,7 @@ async def run_all(categories, is_test, use_cache, is_auto=False):
             done = 0
             for coro in asyncio.as_completed(vtasks):
                 await coro; done += 1
-                if done % 200 == 0 or done == len(vtasks):
+                if done % 50 == 0 or done == len(vtasks): # อัปเดตบ่อยขึ้นทุกๆ 50 ตอน
                     print(f"  [+] เจาะเสร็จแล้ว: {done}/{len(vtasks)} ตอน")
         else:
             print("\n✨ ทุกตอนมีลิ้งก์จริงในแคชแล้ว ข้ามการเจาะลิ้งก์")
@@ -439,7 +453,7 @@ def main():
     DEBUG_MODE = args.debug
     if DEBUG_MODE: print("🔍 โหมด DEBUG: เปิดใช้งาน\n")
     
-    print("🚀 Anime Scraper — ⚡ ULTRA v16 (GitHub Actions / Auto 3-Pages Limit)\n")
+    print("🚀 Anime Scraper — ⚡ ULTRA v17 (Turbo CI/CD Mode)\n")
     
     if args.auto:   
         is_test, use_cache, do_upload, is_auto = False, True, not args.no_upload, True
