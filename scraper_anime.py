@@ -1,13 +1,12 @@
 """
-scraper_anime.py — ULTRA Edition v2 (Debug + Robust)
+scraper_anime.py — ULTRA Edition v3 (Bypass Ads + Tailwind Ready)
 แก้ไข:
-  1. HTTP status log ทุก request (--debug)
-  2. SSL context ถูกต้อง
-  3. selector fallback หลายแบบ
-  4. dump HTML หน้าแรก (--debug)
-  5. warmup cookie ก่อนเริ่ม
+  1. ดึง HTML ตรงจาก CSS Class ล่าสุด (Tailwind)
+  2. ทะลวง iframe แก้ Base64 Decode ตัดเว็บโฆษณา/เว็บพนัน
+  3. เรียงลำดับตอน (Episode) จากชื่อภาษาไทย "ตอนที่..." แทนการใช้ ID
+  4. HTTP status log ทุก request (--debug)
 """
-import json, os, argparse, asyncio, aiohttp, time, base64, re, ssl
+import json, os, argparse, asyncio, aiohttp, time, base64, re, ssl, urllib.parse
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse, parse_qs
 
@@ -47,9 +46,7 @@ async def fetch(session, sem, url):
                     if resp.status == 200:
                         return await resp.text(errors="replace")
                     elif resp.status == 403:
-                        body = await resp.text(errors="replace")
                         print(f"  [!] 403 Forbidden: {url[:70]}")
-                        if DEBUG_MODE: print(f"       body={body[:300]}")
                         await asyncio.sleep(2**attempt); continue
                     elif resp.status == 429:
                         wait = 5*attempt
@@ -58,19 +55,20 @@ async def fetch(session, sem, url):
                     elif resp.status >= 500:
                         if attempt < MAX_RETRIES:
                             await asyncio.sleep(2**attempt); continue
-                        print(f"  [!] {resp.status} Server error: {url[:70]}")
                         return None
                     else:
-                        print(f"  [!] HTTP {resp.status}: {url[:70]}")
+                        if DEBUG_MODE: print(f"  [!] HTTP {resp.status}: {url[:70]}")
                         return None
             except asyncio.TimeoutError:
-                print(f"  [!] Timeout (attempt {attempt}): {url[:70]}")
+                if DEBUG_MODE: print(f"  [!] Timeout (attempt {attempt}): {url[:70]}")
                 if attempt < MAX_RETRIES: await asyncio.sleep(attempt*2)
             except aiohttp.ClientConnectorError as e:
-                print(f"  [!] Connect error: {e}"); return None
+                if DEBUG_MODE: print(f"  [!] Connect error: {e}")
+                return None
             except Exception as e:
                 if attempt == MAX_RETRIES:
-                    print(f"  [!] {type(e).__name__}: {e}"); return None
+                    if DEBUG_MODE: print(f"  [!] {type(e).__name__}: {e}")
+                    return None
                 await asyncio.sleep(attempt)
     return None
 
@@ -87,96 +85,128 @@ def make_abs(href):
 # ── Parsers ───────────────────────────────────────────
 def parse_anime_list(html, label=""):
     soup = BeautifulSoup(html, "html.parser")
-    # try selectors in order
     cards = soup.select("a.group.block")
-    if not cards:
-        cards = [a for a in soup.find_all("a", href=True)
-                 if re.search(r"/anime/\d+", a.get("href",""))]
+    
     if DEBUG_MODE:
         print(f"  [DEBUG][{label}] cards found: {len(cards)}")
-        if not cards:
-            print(f"  [DEBUG] HTML snippet: {html[:600]}")
+
     out = []
     for card in cards:
-        href = card.get("href","")
-        if not re.search(r"/anime/\d+", href): continue
-        img = card.find("img")
-        title = (img.get("alt","") if img else "").strip()
-        if not title:
-            fd = card.find(class_=lambda c: c and "font-display" in c)
-            title = fd.get_text(strip=True) if fd else card.get_text(strip=True)[:80]
-        cover = ""
-        if img:
-            cover = img.get("src","") or ""
-            if not cover:
-                ss = img.get("srcset","")
-                if ss: cover = ss.split(",")[0].strip().split()[0]
-        sticker = card.find(class_="sticker")
-        badge = sticker.get_text(strip=True) if sticker else ""
-        out.append({"title":title,"link":make_abs(href),"cover":cover,
-                    "badge":badge,"episodes":[],"source_cat_id":"","sort_order":0})
+        href = card.get("href", "")
+        if "/anime/" not in href: continue
+
+        # Title (จากคลาส .font-display ล่าสุด)
+        title_elem = card.select_one(".font-display")
+        title = title_elem.get_text(strip=True) if title_elem else ""
+        
+        # Fallback Title จาก Image Alt
+        img = card.select_one("img")
+        if not title and img:
+            title = img.get("alt", "").strip()
+
+        # Cover Image
+        cover = img.get("src", "") if img else ""
+        
+        # Badge (SUB, DUB, MOVIE, AIRING)
+        badge_elem = card.select_one(".sticker")
+        badge = badge_elem.get_text(strip=True) if badge_elem else ""
+
+        if title:
+            out.append({
+                "title": title,
+                "link": make_abs(href),
+                "cover": cover,
+                "badge": badge,
+                "episodes": [],
+                "source_cat_id": "",
+                "sort_order": 0
+            })
     return out
 
 def detect_cat(title, badge):
-    if badge=="MOVIE" or "เดอะมูฟวี่" in title: return "3"
-    if "พากย์ไทย" in title or badge=="DUB": return "2"
+    if badge == "MOVIE" or "เดอะมูฟวี่" in title or "Movie" in badge: return "3"
+    if "พากย์ไทย" in title or badge == "DUB": return "2"
     return "1"
 
 def parse_episodes(html):
     soup = BeautifulSoup(html, "html.parser")
     eps = []
+    
+    # โครงสร้างล่าสุดคือ <a class="ep-row ..."><span class="text-[13px]">ชื่อตอน</span></a>
     for a in soup.select("a.ep-row"):
-        href = a.get("href","")
+        href = a.get("href", "")
         if "/episode/" not in href: continue
+        
         span = a.find("span")
         title = span.get_text(strip=True) if span else href.split("/")[-1]
-        eps.append({"title":title,"url":make_abs(href)})
-    if not eps:
-        for a in soup.find_all("a", href=re.compile(r"/episode/")):
-            eps.append({"title":a.get_text(strip=True) or a["href"].split("/")[-1],
-                        "url":make_abs(a["href"])})
-    eps.sort(key=lambda e: int(m.group(1)) if (m:=re.search(r"/episode/(\d+)",e["url"])) else 0)
+        eps.append({"title": title, "url": make_abs(href)})
+    
+    # ฟังก์ชันสกัดตัวเลขตอนจากชื่อภาษาไทย เพื่อความแม่นยำในการ Sort
+    def extract_ep_num(ep_title):
+        match = re.search(r'ตอนที่\s*(\d+)', ep_title)
+        if match:
+            return int(match.group(1))
+        # ถ้าไม่มี "ตอนที่" ลองสกัด ID จาก URL เป็นแผนสำรอง
+        match_url = re.search(r'/episode/(\d+)', ep_title)
+        return int(match_url.group(1)) if match_url else 0
+
+    eps.sort(key=lambda e: extract_ep_num(e["title"]))
     return eps
 
 def decode_video(html):
+    """เจาะทะลุ iframe โฆษณา เพื่อดึงลิ้งก์สตรีมจริง (akuma-player ฯลฯ)"""
     soup = BeautifulSoup(html, "html.parser")
-    iframe = soup.find("iframe", src=re.compile(r"embed\.php"))
-    if not iframe: iframe = soup.find("iframe")
-    if not iframe: return None
-    src = iframe.get("src","")
-    if not src: return None
-    qs = parse_qs(urlparse(src).query)
-    if "link" in qs:
-        b64 = qs["link"][0] + "=" * ((4-len(qs["link"][0])%4)%4)
-        try:
-            real = base64.b64decode(b64).decode("utf-8")
-            if real.startswith("http"): return real
-        except: pass
-    return src if src.startswith("http") else make_abs(src)
+    iframes = soup.find_all("iframe")
+    
+    for iframe in iframes:
+        src = iframe.get("src", "")
+        if not src: continue
+        
+        # 1. เช็คโครงสร้าง embed.php?link= (Base64 Encoded)
+        if "embed.php" in src and "link=" in src:
+            qs = parse_qs(urlparse(src).query)
+            if "link" in qs:
+                encoded_link = qs["link"][0]
+                # แก้ URL Encoding (เผื่อถูกเข้ารหัสมา %2B, %3D)
+                encoded_link = urllib.parse.unquote(encoded_link)
+                # เติม Padding ให้ครบถ้วน ป้องกัน Base64 ถอดรหัสไม่ได้
+                b64 = encoded_link + "=" * ((4 - len(encoded_link) % 4) % 4)
+                try:
+                    real_url = base64.b64decode(b64).decode("utf-8")
+                    if real_url.startswith("http"):
+                        return real_url
+                except Exception as e:
+                    if DEBUG_MODE: print(f"  [DEBUG] Base64 Decode Error: {e}")
+                    pass
+        
+        # 2. ถ้าเจอลิ้งก์ตรงโดยไม่ต้อง Decode (Player หลัก)
+        elif any(player in src for player in ["akuma-player", "dood", "ok.ru"]):
+            return src if src.startswith("http") else make_abs(src)
+
+    return None
 
 # ── Crawlers ──────────────────────────────────────────
 async def crawl_page(session, sem, source_id, page):
     url = build_list_url(source_id, page)
     html = await fetch(session, sem, url)
     if not html: return []
-    if DEBUG_MODE and page == 1:
-        fname = f"debug_{source_id}_p1.html"
-        open(fname,"w",encoding="utf-8").write(html)
-        print(f"  [DEBUG] dump → {fname} ({len(html):,} bytes)")
+    
     animes = parse_anime_list(html, label=f"{source_id}/p{page}")
     for a in animes:
-        a["source_cat_id"] = detect_cat(a["title"],a["badge"]) if source_id=="HOME" else source_id
+        a["source_cat_id"] = detect_cat(a["title"], a["badge"]) if source_id=="HOME" else source_id
     return animes
 
 async def crawl_eps(session, sem, anime):
     html = await fetch(session, sem, anime["link"])
-    if html: anime["episodes"] = parse_episodes(html)
+    if html: 
+        anime["episodes"] = parse_episodes(html)
 
 async def crawl_vid(session, sem, ep):
     html = await fetch(session, sem, ep["url"])
     if html:
-        real = decode_video(html)
-        if real: ep["url"] = real
+        real_url = decode_video(html)
+        if real_url: 
+            ep["url"] = real_url
 
 # ── Cache ─────────────────────────────────────────────
 def load_cache(path="anime_data.js"):
@@ -218,7 +248,7 @@ async def run_all(categories, is_test, use_cache):
         # 1) scan pages
         all_animes, seen, sort_idx = [], set(), 1_000_000
         for cat in categories:
-            print(f"\n[1/3] {cat['name']}")
+            print(f"\n[1/3] หมวดหมู่: {cat['name']}")
             max_pg = 1 if is_test else cat["max_page"]
             empty_streak = 0
             for page in range(1, max_pg+1):
@@ -235,23 +265,22 @@ async def run_all(categories, is_test, use_cache):
                         seen.add(a["link"])
                         a["sort_order"] = sort_idx; sort_idx -= 1
                         all_animes.append(a); added += 1
-                print(f"  [+] หน้า {page}: +{added} (รวม {len(all_animes)})")
+                print(f"  [+] ดึงหน้า {page}: สำเร็จ +{added} เรื่อง (รวม {len(all_animes)})")
                 if is_test: break
 
-        print(f"\n📌 รวม {len(all_animes)} เรื่อง")
+        print(f"\n📌 ดึงข้อมูลโครงสร้างเสร็จสิ้น: รวม {len(all_animes)} เรื่อง")
         if not all_animes:
             print("\n❌ ได้ 0 เรื่อง! ลองรัน: python scraper_anime.py --debug --test")
-            print("   แล้วดูไฟล์ debug_HOME_p1.html ว่า HTML จริงมีอะไร")
             return []
 
         # 2) episodes
-        print(f"\n[2/3] ดึงตอน...")
+        print(f"\n[2/3] กำลังสแกนหาลิสต์ตอนทั้งหมด...")
         tasks = [crawl_eps(session, sem, a) for a in all_animes]
         done = 0
         for coro in asyncio.as_completed(tasks):
             await coro; done += 1
             if done % 50 == 0 or done == len(tasks):
-                print(f"  [+] {done}/{len(tasks)}")
+                print(f"  [+] สแกนตอนแล้ว: {done}/{len(tasks)} เรื่อง")
 
         # 2.5) check cache
         to_crack, cached_n = [], 0
@@ -263,73 +292,86 @@ async def run_all(categories, is_test, use_cache):
                 else:
                     to_crack.append(ep)
         total_eps = sum(len(a["episodes"]) for a in all_animes)
-        print(f"\n📊 {total_eps} ตอน | แคช {cached_n} | ใหม่ {len(to_crack)}")
+        print(f"\n📊 พบทั้งหมด {total_eps} ตอน | ใช้แคชเก่า {cached_n} ตอน | ต้องเจาะลิ้งก์ใหม่ {len(to_crack)} ตอน")
 
         # 3) video URLs
         if to_crack:
-            print(f"\n[3/3] เจาะวิดีโอ {len(to_crack)} ตอน...")
+            print(f"\n[3/3] กำลังเจาะทะลวงดึงลิ้งก์วิดีโอจริง (Bypass Ads) {len(to_crack)} ตอน...")
             vtasks = [crawl_vid(session, sem, ep) for ep in to_crack]
             done = 0
             for coro in asyncio.as_completed(vtasks):
                 await coro; done += 1
                 if done % 200 == 0 or done == len(vtasks):
-                    print(f"  [+] {done}/{len(vtasks)}")
+                    print(f"  [+] เจาะเสร็จแล้ว: {done}/{len(vtasks)} ตอน")
         else:
-            print("\n✨ ทุกตอนอยู่ในแคช")
+            print("\n✨ ทุกตอนมีลิ้งก์จริงในแคชแล้ว ข้ามการเจาะลิ้งก์")
 
     return all_animes
 
 # ── Save ──────────────────────────────────────────────
 def save_to_file(animes, path="anime_data.js"):
-    cat_names = {"1":"ซับไทย","2":"พากย์ไทย","3":"เดอะมูฟวี่"}
+    cat_names = {"1":"ซับไทย", "2":"พากย์ไทย", "3":"เดอะมูฟวี่"}
     export = {}
     for a in animes:
         sid = a.get("source_cat_id","1")
         if sid not in cat_names: sid = "1"
-        if sid not in export: export[sid] = {"name":cat_names[sid],"animes":[]}
-        export[sid]["animes"].append({"title":a["title"],"link":a["link"],"cover":a["cover"],
-            "badge":a.get("badge",""),"sort_order":a.get("sort_order",0),"episodes":a["episodes"]})
+        if sid not in export: export[sid] = {"name":cat_names[sid], "animes":[]}
+        export[sid]["animes"].append({
+            "title": a["title"],
+            "link": a["link"],
+            "cover": a["cover"],
+            "badge": a.get("badge",""),
+            "sort_order": a.get("sort_order",0),
+            "episodes": a["episodes"]
+        })
     for sid in export:
-        export[sid]["animes"].sort(key=lambda x:x["sort_order"],reverse=True)
+        export[sid]["animes"].sort(key=lambda x:x["sort_order"], reverse=True)
     try:
-        with open(path,"w",encoding="utf-8") as f:
+        with open(path, "w", encoding="utf-8") as f:
             f.write("const animeData = ")
-            json.dump(export,f,ensure_ascii=False,indent=2)
+            json.dump(export, f, ensure_ascii=False, indent=2)
             f.write(";")
         total = sum(len(v["animes"]) for v in export.values())
         eps = sum(len(a["episodes"]) for v in export.values() for a in v["animes"])
-        print(f"\n✅ บันทึก '{path}': {total} เรื่อง {eps} ตอน")
+        print(f"\n✅ บันทึกไฟล์ '{path}' สำเร็จ! ({total} เรื่อง {eps} ตอน)")
     except Exception as e:
         print(f"❌ บันทึกผิดพลาด: {e}")
     return export
 
 # ── API push ──────────────────────────────────────────
 async def push_to_api(export_data):
-    url = os.getenv("ADMIN_URL",""); key = os.getenv("SECRET_KEY","")
-    if not url or not key: print("\n❌ ไม่พบ ADMIN_URL/SECRET_KEY"); return
+    url = os.getenv("ADMIN_URL","")
+    key = os.getenv("SECRET_KEY","")
+    if not url or not key: 
+        print("\nℹ️ ไม่พบ ADMIN_URL หรือ SECRET_KEY ข้ามการอัปโหลดเข้าเซิร์ฟเวอร์")
+        return
+        
     if "ajax_import=1" not in url:
         sep = "&" if "?" in url else "?"
-        url = url.rstrip("/")+sep+"page=admin&ajax_import=1"
-    BATCH=50; batches=[]
-    for cid,cd in export_data.items():
-        animes=cd["animes"]
-        for i in range(0,len(animes),BATCH):
-            batches.append({cid:{"name":cd["name"],"animes":animes[i:i+BATCH]}})
-    h={"Content-Type":"application/json","X-Admin-Key":key}
+        url = url.rstrip("/") + sep + "page=admin&ajax_import=1"
+        
+    BATCH = 50
+    batches = []
+    for cid, cd in export_data.items():
+        animes = cd["animes"]
+        for i in range(0, len(animes), BATCH):
+            batches.append({cid: {"name": cd["name"], "animes": animes[i:i+BATCH]}})
+            
+    h = {"Content-Type":"application/json", "X-Admin-Key":key}
     async with aiohttp.ClientSession(headers=h) as session:
-        print(f"\n🚀 ส่ง {len(batches)} ชุด → {url}")
-        for i,batch in enumerate(batches,1):
+        print(f"\n🚀 กำลังส่ง {len(batches)} ชุดข้อมูล → API: {url}")
+        for i, batch in enumerate(batches, 1):
             try:
-                async with session.post(url,json=batch,timeout=aiohttp.ClientTimeout(total=60)) as resp:
-                    text=await resp.text()
+                async with session.post(url, json=batch, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+                    text = await resp.text()
                     try:
-                        r=json.loads(text)
-                        print(f"  {'✅' if r.get('success') else '❌'} {i}/{len(batches)}: {r.get('message','')}")
+                        r = json.loads(text)
+                        print(f"  {'✅' if r.get('success') else '❌'} ชุดที่ {i}/{len(batches)}: {r.get('message','')}")
                     except:
-                        print(f"  [!] {i}/{len(batches)}: HTTP {resp.status} {text[:200]}")
+                        print(f"  [!] ชุดที่ {i}/{len(batches)}: HTTP {resp.status} {text[:100]}...")
             except Exception as e:
-                print(f"  [!] {i}: {e}")
-    print("✅ ส่งเสร็จ!")
+                print(f"  [!] ชุดที่ {i}: ส่งผิดพลาด ({e})")
+    print("✅ การอัปโหลดเสร็จสิ้น!")
 
 # ── Entry point ───────────────────────────────────────
 CATEGORIES = [
@@ -345,25 +387,44 @@ def main():
     p.add_argument("--auto",      action="store_true")
     p.add_argument("--full",      action="store_true")
     p.add_argument("--test",      action="store_true")
-    p.add_argument("--debug",     action="store_true", help="แสดง HTTP status + dump HTML")
+    p.add_argument("--debug",     action="store_true", help="แสดง HTTP status")
     p.add_argument("--no-upload", action="store_true")
     args = p.parse_args()
+    
     DEBUG_MODE = args.debug
-    if DEBUG_MODE: print("🔍 DEBUG MODE ON\n")
-    print("🚀 Anime Scraper — ⚡ ULTRA v2\n")
-    if args.auto:   is_test,use_cache,do_upload = False,True,not args.no_upload; print("🤖 AUTO")
-    elif args.test: is_test,use_cache,do_upload = True,False,False;              print("🧪 TEST")
-    elif args.full: is_test,use_cache,do_upload = False,False,not args.no_upload;print("💥 FULL")
+    if DEBUG_MODE: print("🔍 โหมด DEBUG: เปิดใช้งาน\n")
+    
+    print("🚀 Anime Scraper — ⚡ ULTRA v3 (Ad Bypass)\n")
+    
+    if args.auto:   
+        is_test, use_cache, do_upload = False, True, not args.no_upload
+        print("🤖 หมวด: AUTO (อัปเดตเฉพาะตอนใหม่)")
+    elif args.test: 
+        is_test, use_cache, do_upload = True, False, False
+        print("🧪 หมวด: TEST (ดึงเฉพาะหน้าแรกเพื่อทดสอบ)")
+    elif args.full: 
+        is_test, use_cache, do_upload = False, False, not args.no_upload
+        print("💥 หมวด: FULL (ดึงใหม่ทั้งหมด ล้างแคช)")
     else:
-        print("1=Full  2=Test  3=Fast Update")
-        c=input("👉 ").strip()
-        is_test,use_cache,do_upload = c=="2",c=="3",False
-    t0=time.time()
-    animes = asyncio.run(run_all(CATEGORIES,is_test,use_cache))
+        print("กรุณาเลือกโหมดการทำงาน:")
+        print("  1 = ดึงใหม่ทั้งหมด (Full)")
+        print("  2 = ทดสอบระบบ (Test 1 หน้า)")
+        print("  3 = อัปเดตแบบรวดเร็ว (Fast Update / ใช้ Cache)")
+        c = input("👉 เลือกตัวเลข: ").strip()
+        is_test, use_cache, do_upload = (c=="2"), (c=="3"), False
+        
+    t0 = time.time()
+    
+    # Run Async loop
+    animes = asyncio.run(run_all(CATEGORIES, is_test, use_cache))
     export = save_to_file(animes)
-    if do_upload: asyncio.run(push_to_api(export))
-    print(f"\n⏱  {time.time()-t0:.1f}s")
-    if not any([args.auto,args.full,args.test,args.debug]): input("\nEnter เพื่อปิด...")
+    
+    if do_upload: 
+        asyncio.run(push_to_api(export))
+        
+    print(f"\n⏱  ใช้เวลาทั้งหมด: {time.time()-t0:.1f} วินาที")
+    if not any([args.auto, args.full, args.test]): 
+        input("\nกด Enter เพื่อปิดโปรแกรม...")
 
 if __name__ == "__main__":
     main()
